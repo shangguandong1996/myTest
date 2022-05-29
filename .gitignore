@@ -1,0 +1,12 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+*.txt
+test/**/*.rda
+test/**/*.csv
+test/**/*.bam*
+test/**/*.bed*
+test/**/*Peak*
+

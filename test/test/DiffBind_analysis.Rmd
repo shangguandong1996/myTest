@@ -1,0 +1,296 @@
+---
+title: "DiffBind_analysis"
+author: "Guandong Shang"
+date: '2022-05-29'
+output: rmarkdown::github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      collapse = TRUE)
+
+```
+
+
+由于在服务器的R版本升级到R 4.2之后，整个DiffBind的流程相比于之前R 3.6时代有了些许变化。所以这里我重新再写一份基于DiffBind的ChIP-seq差异分析。
+
+具体的DiffBind文档参见[DiffBind官方文档](https://bioconductor.org/packages/release/bioc/vignettes/DiffBind/inst/doc/DiffBind.pdf)
+
+# 准备工作
+如果想要使用DiffBind的话，你需要准备好bam文件和peak文件。bam文件由比对产生，peak文件由MACS2等一系列callPeak软件产生。这里我使用的是常规的bowtie2比对，然后产生的bam文件用MACS2去callPeak这套流程。
+
+我们首先来看下我们的rawdata文件里面的组成
+```{bash}
+# tree是bash命令
+# 只是我用来展示而已，并不能在R里面跑
+tree rawdata
+```
+
+可以看到你需要准备好input和IP的bam、bam.bai以及对应的由bam所产生的peak文件。这里由于是H3K27me3的数据，所以产生的是broadPeak文件。
+
+在将得到的bam和peak文件软链接到`rawdata`文件夹之后，我们就需要做一个表格来告诉DiffBind你的样本是什么，你的样本对应的处理是什么，你的样本对应的路径在哪里等等。
+
+
+```{r}
+bam_files <- list.files("rawdata/bam", pattern = "bam$", 
+                        full.names = TRUE)
+
+bam_files
+
+peak_files <- list.files("rawdata/peak", 
+                         full.names = TRUE)
+
+peak_files
+```
+
+
+```{r}
+# 具体需要的列参见DiffBind的手册
+# 这里只列出了需要完成一个简单的两样本比较最少需要的列
+sample_info <- data.frame(
+  SampleID = paste(rep(c("W3", "WT"), each = 2),
+                    c("R1", "R2"),
+                    sep = "_"),
+  
+  Tissue = rep(c("W3", "WT"), each = 2),
+  
+  Replicate = 1:2,
+  
+  bamReads = bam_files[5:8],
+  
+  ControlID = paste(rep(c("W3_input", "WT_input"), each = 2),
+                    c("R1", "R2"),
+                    sep = "_"),
+  
+  bamControl = bam_files[1:4],
+  
+  Peaks = peak_files,
+  
+  # 尽管我们这里是broadPeak
+  # 但是由于broaPeak和narrowPeak的格式类似
+  # 所以这里可以用narrowPeak
+  PeakCaller = "narrow"
+  
+)
+
+# 在做完之后要核对一下是否正确
+sample_info
+```
+
+
+# DiffBind数据导入
+
+```{r, message=FALSE}
+library(DiffBind)
+
+library(BiocParallel)
+```
+
+第一步是根据你整理的sample表来导入bam文件和peak文件
+```{r}
+dba_H3K27me3 <- dba(minOverlap = 2, sampleSheet = sample_info)
+
+# 通过对象展现的数据
+# 我们可以有个大致了解你每个样本的peak数目是多少
+# 可以看到，在合并了全部的peak之后，得到了9060个peak
+# 然后由于我们的minOverlap设置为2，所以最终得到了8507个peak在至少两个样本都是出现的
+dba_H3K27me3
+```
+
+需要注意的是之前我一直以为这里的`minOverlap=2`是指peak要在你同一处理中两个重复中都有才会将其考虑在内。但实际上，`minOverlap=2`只是单纯得到哪些在任意两个样本中都有的peak。对于我们这个4个broadPeak的样本而言，你可以选择`minOverlap`为1,2,3,4。
+```{r}
+# 分别代表了至少在1,2,3,4个样本中都有的peak数目
+# 8507就是我们最终的数目
+dba.overlap(dba_H3K27me3, mode = DBA_OLAP_RATE)
+```
+如果你想要得到在A中至少两个重复有，或者B中至少两个重复有的peak，参考[DiffBind minOverlap parameter](https://support.bioconductor.org/p/125808/)。
+
+# 生成Graylist
+
+在我们R 3.6的时代，DiffBind的默认操作是IP的count减去对应的input的count。但大家认为这样可能并不是非常地准确，所以在R 4.2这个版本的DiffBind在做差异分析时候使用的count是IP自身的peakCount，而不是IP减去input的count。
+对应的，作者使用了`greylist`这个方法来充分使用input的信息。具体的`greylist`信息参见DiffBin的文档和[Generating Grey Lists from Input Libraries](https://bioconductor.org/packages/release/bioc/vignettes/GreyListChIP/inst/doc/GreyList-demo.pdf)
+
+
+在做dba.blacklist之前，我们需要得到你物种的seqinfo。如果你之前物种已经做过了Txdb，且做Txdb的时候将染色体长度放进去了。后面直接`greylist=seqinfo(Txdb)`就可以了。如果没有的话，就需要再重新做一次
+
+```{r}
+# fa.fai是靠samtools faidx做出来的
+# 这里的基因组就是你比对的基因组
+chromInfo <- read.table("/data2/lxl_data/reference/genome/1800/1800_fa_nin_nsq_nhr/1800.fa.fai")
+
+head(chromInfo)
+
+seqinfo_obj <- Seqinfo(seqnames = chromInfo$V1,
+                       seqlengths = chromInfo$V2)
+seqinfo_obj
+```
+
+
+
+```{r}
+# 由于非模式物种没有blacklist
+# 所以只跑一个greylist
+dba_H3K27me3 <- dba.blacklist(dba_H3K27me3,
+                              blacklist = FALSE,
+                              greylist = seqinfo_obj)
+
+# 可以看到从原来的8507变成了8505，去掉了两个区域
+dba_H3K27me3
+```
+
+# 数count
+
+这一步是根据你的bam文件和合并得到的peak location去数每个peak里面的count。
+
+需要注意的是在我们之前的DiffBind版本中，默认地是不summit peak的。而在这个版本的DiffBind中，默认地是设置`summit=200`，即首先将前面得到的peak合集根据你的summit位点左右扩增200bp，最终所有的peak就都会是400bp了。
+对于像H3K27me3这种比较宽的peak，长度太长的话，两相比较，统计会不显著。而如果我们根据peak summit，recenter peak之后，就可以提高我们发现显著差异peak的能力了。
+
+> 这个参数大家根据自己的需要来确定是否是FALSE。像我ATAC-seq一般会调整成summit=FALSE，而H3K27me3则不调整。TF ChIP-seq也可以尝试summit=FALSE。
+
+```{r}
+dba_H3K27me3 <- dba.count(dba_H3K27me3)
+
+# 在count完了之后还会报告FRiP
+# 则你peak里面的count数目占对应bam的count数目
+dba_H3K27me3
+```
+
+```{r}
+# 这时候可以画一个相关性图
+dba.plotHeatmap(dba_H3K27me3)
+
+# 或者PCA图
+dba.plotPCA(dba_H3K27me3,
+            label=DBA_ID,
+            labelSize = 0.5)
+```
+
+# Normalizing the data
+
+这一步是对你的peak count矩阵做矫正，类似于我们RNA-seq分析的时候DESeq2的那种矫正。
+但是DiffBind这里默认的矫正并不是DESeq2，具体的细节大家可以自己去看文档。
+
+```{r}
+dba_H3K27me3 <- dba.normalize(dba_H3K27me3)
+```
+
+# Establishing a model design and contrast
+这一步是定义好你要谁和谁进行比较
+
+```{r}
+# 这里contrast用法跟DESeq2是一样的
+dba_H3K27me3 <- dba.contrast(dba_H3K27me3,
+                             contrast = c("Tissue", "W3", "WT"))
+
+dba_H3K27me3
+```
+
+# Performing the differential analysis
+
+这一步就是做差异分析了，默认是调用DESeq2
+
+```{r}
+# 我们前面算过greylist了
+# 这里就不用算了
+dba_H3K27me3 <- dba.analyze(dba_H3K27me3,
+                            bBlacklist = FALSE,
+                            bGreylist = FALSE)
+```
+
+```{r}
+# 可以画一个MAplot
+# 你可以调整fold的数值
+# 默认是0
+
+# 但需要注意的是，R 4.2版本的DIffBind dba.plotMA跟我们之前的3.6版本对应的dba.plotMA在对Fold的设定上有着完全不同的结果
+# 根据manual来看，一旦你设定了Fold的数值，那么对应的p-value和FDR就会重新计算
+# 这相当于DESeq2 results函数里面去设定Fold
+# 结果会比较严格
+
+# 所以对于这个版本的DiffBind而言，建议plotMA只是作为一个参考
+# 如果想要画图的话，可以考虑自己用ggplot2画火山图
+dba.plotMA(dba_H3K27me3)
+
+dba.plotMA(dba_H3K27me3, fold = 1)
+```
+
+
+# Retrieving the differentially bound sites
+
+```{r}
+# th=1可以输出所有的结果
+result_diff <- dba.report(dba_H3K27me3,
+                          th = 1)
+
+# 输出的对象是GRange类型的
+# 是按照FDR的顺序进行排序的
+# 这里的Conc_XX是log2(norm Reads)之后的值
+# 如果你想要输出的格式是按照location排的，可以sort(result_diff)
+result_diff
+
+```
+
+
+# 提取结果
+我们首先重命名GRanges中每个peak的名字，这会方便我们同时在IGV中对照着看结果。
+然后我们再加一列peak的id，这会方便我们的以后的操作。
+```{r}
+names(result_diff) <- paste0("H3K27me3_", names(result_diff))
+result_diff$feature_id <- names(result_diff)
+
+result_diff
+```
+
+然后我们可以输出这个GRanges格式成bed文件，方便我们导入到IGV里面查看
+```{r}
+# 加一个sort可以让输出bed结果看起来整齐
+rtracklayer::export.bed(sort(result_diff),
+                        con = "result/H3K27me3_diff.merge.bed")
+```
+
+```{bash}
+# 调用bash中的head命令看下我们输出的bed文件
+head result/H3K27me3_diff.merge.bed
+```
+
+然后对于差异分析的结果，我们可以转换成tibble或者df格式，然后输出成csv
+```{r}
+readr::write_csv(as.data.frame(result_diff),
+                 file = "result/H3K27me3_diff.csv")
+```
+
+因为后续我们还需要对peak进行注释，所以我们也需要保存所产生的GRanges对象
+```{r}
+save(result_diff, file = "result/H3K27me3_diff_Gr.rda")
+```
+
+有些人可能还需要用对应样本的数值来画热图，所以我们这里也可以提取出每个peak在每个样本中矫正后的数值
+```{r}
+normCount_mt <- mcols(dba.peakset(dba_H3K27me3, bRetrieve = TRUE))
+
+head(normCount_mt)
+
+# 我们可以给其加行名
+rownames(normCount_mt) <- paste0("H3K27me3_", rownames(normCount_mt))
+
+normCount_mt <- as.matrix(normCount_mt)
+save(normCount_mt, file = "result/normCount_mt.rda")
+```
+
+前面提到了`result_diff`里面的`Conc_XX`是log2(normReads)之后的结果，我们可以来检查下
+```{r}
+result_diff["H3K27me3_3011"]
+
+# 几乎是一模一样的
+mean(log2(normCount_mt["H3K27me3_3011", c(1:2)]))
+mean(log2(normCount_mt["H3K27me3_3011", c(3:4)]))
+
+```
+
+# 一些乱七八糟的
+
+对于DEX诱导的GR TF ChIP-seq。我发现由于GR渗漏的原因，可能会漏掉一些位点。对于这种情况，如果这个位点对你很重要，可以考虑用`csaw`包去做差异peak分析。
+
+```{r}
+sessionInfo()
+```
